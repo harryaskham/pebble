@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "listen": {"host": "127.0.0.1", "port": 11301, "request_timeout_secs": 30, "max_connections": 4},
+  "token_file": "~/.config/pebble/ingress.token",
+  "state_dir": "~/.local/state/pebble/audio",
+  "max_body_bytes": 8388608,
+  "max_pending": 128,
+  "max_archive_bytes": 10737418240,
+  "min_free_bytes": 1073741824,
+  "retry_delays_secs": [2, 10, 30],
+  "ffmpeg": "ffmpeg",
+  "node": "node",
+  "transcription": {
+    "provider": "command",
+    "model": "whisper-1",
+    "command": ["pebble-transcribe"],
+    "output": "json",
+    "language": "en",
+    "timeout_secs": 60,
+    "max_audio_secs": 120
+  },
+  "forward": {
+    "url": "https://hooks.example.invalid/pebble",
+    "timeout_secs": 30,
+    "auth": "bearer-file",
+    "token_file": "~/.config/pebble/webhook.token",
+    "receipt": "http-2xx"
+  },
+  "chime": {"enabled": false, "argv": ["pebble-chime"], "server": "", "pitch": 523.25, "duration": 0.06, "gain": 0.1}
+}

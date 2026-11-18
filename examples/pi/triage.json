@@ -1,0 +1,7 @@
+{
+  "tokenFile": "~/.config/pebble/ingress.token",
+  "stateDir": "~/.local/state/pebble/pi",
+  "allowLive": false,
+  "timeoutMs": 95000,
+  "maxTokens": 4096
+}

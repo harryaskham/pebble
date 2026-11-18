@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# Synthesize a short tone with SoX and stream it to a PulseAudio server.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: chime [OPTIONS] [PITCH_HZ]
+       chime --score 'C5/8 E5/8 G5/4 R/8 C6/2' [--tempo BPM] [OPTIONS]
+
+Emit a short synthesized chime as raw PCM through paplay. The Pulse server is
+selected by --server, CHIME_SERVER, or PULSE_SERVER (in that order).
+
+Options:
+  -p, --pitch HZ       Base pitch in hertz (default: CHIME_PITCH or 660)
+  -s, --step N         Transpose the base pitch by N semitones
+  -d, --duration SEC   Chime duration (default: CHIME_DURATION or 0.10)
+  -g, --gain LEVEL     Linear gain from 0 through 1 (default: CHIME_GAIN or 0.18)
+  -w, --wave WAVE      sine, triangle, square, or sawtooth (default: sine)
+      --rate HZ         PCM sample rate (default: CHIME_RATE or 48000)
+      --server SERVER   PulseAudio server override
+      --sink SINK       PulseAudio sink override
+      --score SCORE     Notes/rests separated by spaces; see notation below
+      --tempo BPM       Quarter-note beats/minute (20–400; CHIME_TEMPO or 120)
+      --print-frequency Print resolved pitch(es); score rests print 0; no audio
+      --dry-run         Print resolved settings and exit without audio
+  -h, --help            Show this help
+
+Environment:
+  CHIME_PITCH, CHIME_DURATION, CHIME_GAIN, CHIME_WAVE, CHIME_RATE,
+  CHIME_SERVER, CHIME_SINK, PULSE_SERVER, CHIME_TEMPO
+
+Score notation:
+  C D E F G A B        Notes; octave defaults to 4 (A4 = 440 Hz)
+  C5 F#4 Bb3          Optional #/b accidental and octave 0–8
+  R or -              Rest
+  C5/8 R/4            Duration: whole-note fraction (1,2,4,8,16,32,64)
+  G4/4.               Dotted quarter note (1.5 times the duration)
+  C4 D4 | E4 R        Omitted duration means quarter; | is a visual separator
+
+Quote the score. --step transposes notes; gain/wave/rate/server/sink apply to
+all notes. --pitch/positional pitch and --duration cannot be combined with
+--score (CHIME_PITCH/CHIME_DURATION are ignored for scores). Scores are limited
+to 256 events / 60 seconds. Audio is rendered before one Pulse playback call.
+
+Examples:
+  chime                         # default tone via $PULSE_SERVER
+  chime 880 --duration 0.06
+  chime --pitch 440 --step 7    # E5 (seven semitones above A4)
+  chime --score 'C5/8 E5/8 G5/4 R/8 C6/2' --tempo 140
+  chime --score 'A4 R/8 A5/4.' --step -2 --dry-run
+  tmux set-hook -g after-select-pane \
+    'run-shell -b "chime --pitch 523.25 --step #{pane_index}"'
+EOF
+}
+
+die() {
+  printf 'chime: %s\n' "$*" >&2
+  exit 2
+}
+
+is_number() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+is_signed_number() {
+  [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+pitch="${CHIME_PITCH:-660}"
+step=""
+duration="${CHIME_DURATION:-0.10}"
+gain="${CHIME_GAIN:-0.18}"
+wave="${CHIME_WAVE:-sine}"
+rate="${CHIME_RATE:-48000}"
+server="${CHIME_SERVER:-${PULSE_SERVER:-}}"
+sink="${CHIME_SINK:-}"
+print_frequency=false
+dry_run=false
+positional_pitch=""
+score=""
+score_set=false
+pitch_set=false
+duration_set=false
+tempo_set=false
+tempo="${CHIME_TEMPO:-120}"
+
+while (($#)); do
+  case "$1" in
+    -p|--pitch)
+      (($# >= 2)) || die "$1 requires a value"
+      pitch_set=true
+      pitch="$2"
+      shift 2
+      ;;
+    --pitch=*) pitch_set=true; pitch="${1#*=}"; shift ;;
+    -s|--step|--semitones)
+      (($# >= 2)) || die "$1 requires a value"
+      step="$2"
+      shift 2
+      ;;
+    --step=*|--semitones=*) step="${1#*=}"; shift ;;
+    -d|--duration)
+      (($# >= 2)) || die "$1 requires a value"
+      duration_set=true
+      duration="$2"
+      shift 2
+      ;;
+    --duration=*) duration_set=true; duration="${1#*=}"; shift ;;
+    -g|--gain)
+      (($# >= 2)) || die "$1 requires a value"
+      gain="$2"
+      shift 2
+      ;;
+    --gain=*) gain="${1#*=}"; shift ;;
+    -w|--wave)
+      (($# >= 2)) || die "$1 requires a value"
+      wave="$2"
+      shift 2
+      ;;
+    --wave=*) wave="${1#*=}"; shift ;;
+    --rate)
+      (($# >= 2)) || die "$1 requires a value"
+      rate="$2"
+      shift 2
+      ;;
+    --rate=*) rate="${1#*=}"; shift ;;
+    --server)
+      (($# >= 2)) || die "$1 requires a value"
+      server="$2"
+      shift 2
+      ;;
+    --server=*) server="${1#*=}"; shift ;;
+    --sink)
+      (($# >= 2)) || die "$1 requires a value"
+      sink="$2"
+      shift 2
+      ;;
+    --sink=*) sink="${1#*=}"; shift ;;
+    --score)
+      (($# >= 2)) || die "$1 requires a value"
+      $score_set && die "--score can only be supplied once"
+      score_set=true; score="$2"; shift 2 ;;
+    --score=*)
+      $score_set && die "--score can only be supplied once"
+      score_set=true; score="${1#*=}"; shift ;;
+    --tempo)
+      (($# >= 2)) || die "$1 requires a value"
+      tempo_set=true; tempo="$2"; shift 2 ;;
+    --tempo=*) tempo_set=true; tempo="${1#*=}"; shift ;;
+    --print-frequency) print_frequency=true; shift ;;
+    --dry-run) dry_run=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --)
+      shift
+      if (($#)); then
+        [[ -z "$positional_pitch" ]] || die "unexpected argument: $1"
+        positional_pitch="$1"
+        shift
+      fi
+      break
+      ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      [[ -z "$positional_pitch" ]] || die "unexpected argument: $1"
+      positional_pitch="$1"
+      shift
+      ;;
+  esac
+done
+
+(($# == 0)) || die "unexpected argument: $1"
+[[ -z "$positional_pitch" ]] || pitch="$positional_pitch"
+
+if $score_set; then
+  [[ -n "$score" && ${#score} -le 32768 ]] || die "score must contain 1–32768 characters"
+  if $pitch_set || $duration_set || [[ -n "$positional_pitch" ]]; then
+    die "--score cannot be combined with --pitch, a positional pitch, or --duration"
+  fi
+  is_number "$tempo" || die "tempo must be a number from 20 through 400 BPM: $tempo"
+else
+  $tempo_set && die "--tempo requires --score"
+  is_number "$pitch" || die "pitch must be a positive number of hertz: $pitch"
+  is_number "$duration" || die "duration must be a positive number of seconds: $duration"
+fi
+is_number "$gain" || die "gain must be between 0 and 1: $gain"
+[[ "$rate" =~ ^[0-9]+$ ]] || die "rate must be an integer: $rate"
+[[ -z "$step" ]] || is_signed_number "$step" || die "step must be a semitone number: $step"
+
+awk_bin="${CHIME_AWK:-awk}"
+command -v "$awk_bin" >/dev/null 2>&1 || die "awk not found: $awk_bin"
+
+resolved_pitch="$pitch"
+if ! $score_set; then
+  if [[ -n "$step" ]]; then
+    resolved_pitch="$("$awk_bin" -v base="$pitch" -v semitones="$step" \
+      'BEGIN { printf "%.6f", base * exp(log(2) * semitones / 12) }')"
+  fi
+  "$awk_bin" -v value="$resolved_pitch" 'BEGIN { exit !(value > 0 && value <= 24000) }' \
+    || die "resolved pitch must be greater than 0 and at most 24000 Hz: $resolved_pitch"
+  "$awk_bin" -v value="$duration" 'BEGIN { exit !(value > 0 && value <= 5) }' \
+    || die "duration must be greater than 0 and at most 5 seconds: $duration"
+fi
+$awk_bin -v value="$gain" 'BEGIN { exit !(value >= 0 && value <= 1) }' \
+  || die "gain must be between 0 and 1: $gain"
+$awk_bin -v value="$rate" 'BEGIN { exit !(value >= 8000 && value <= 192000) }' \
+  || die "rate must be between 8000 and 192000 Hz: $rate"
+case "$wave" in
+  sine|triangle|square|sawtooth) ;;
+  *) die "unsupported wave '$wave' (use sine, triangle, square, or sawtooth)" ;;
+esac
+
+if $score_set; then
+  # Parse plain data, never shell code. Buffer the complete plan before printing
+  # it so malformed/oversized scores cannot leak a partial playback plan.
+  score_plan="$(printf '%s\n' "$score" | "$awk_bin" -v tempo="$tempo" -v rate="$rate" -v step="${step:-0}" '
+    function fail(message) { failed=1; print "chime: " message > "/dev/stderr"; exit 2 }
+    BEGIN {
+      if (!(tempo >= 20 && tempo <= 400)) fail("tempo must be from 20 through 400 BPM")
+      offsets["C"]=0; offsets["D"]=2; offsets["E"]=4; offsets["F"]=5
+      offsets["G"]=7; offsets["A"]=9; offsets["B"]=11
+    }
+    {
+      gsub(/\|/, " ")
+      for (i=1; i<=NF; i++) {
+        token=$i
+        if (token !~ /^([A-Ga-g][#b]?[0-8]?|[Rr-])(\/(1|2|4|8|16|32|64))?\.?$/)
+          fail("invalid score token: " token)
+        dotted=(token ~ /\.$/)
+        clean=token; sub(/\.$/, "", clean)
+        split(clean, parts, "/")
+        note=parts[1]; denominator=(parts[2] == "" ? 4 : parts[2])
+        seconds=(60/tempo)*4/denominator*(dotted ? 1.5 : 1)
+        samples=int(seconds*rate+0.5)
+        seconds=samples/rate
+        total+=samples
+        if (++count > 256) fail("score exceeds 256 events")
+        if (total/rate > 60) fail("score exceeds 60 seconds")
+        frequency=0
+        if (note !~ /^[Rr-]$/) {
+          letter=toupper(substr(note,1,1)); suffix=substr(note,2)
+          accidental=0
+          if (substr(suffix,1,1) == "#") { accidental=1; suffix=substr(suffix,2) }
+          else if (substr(suffix,1,1) == "b") { accidental=-1; suffix=substr(suffix,2) }
+          octave=(suffix == "" ? 4 : suffix+0)
+          midi=(octave+1)*12+offsets[letter]+accidental+step
+          # Check bounds before exp() to avoid overflow from large transposes.
+          if (!(midi >= -100 && midi <= 140)) fail("pitch out of range for " token)
+          frequency=440*exp(log(2)*(midi-69)/12)
+          if (!(frequency > 0 && frequency <= 24000 && frequency < rate/2))
+            fail("pitch out of range or above Nyquist for " token)
+        }
+        attack=seconds/8; if (attack>0.005) attack=0.005
+        release=seconds/4; if (release>0.020) release=0.020
+        events[count]=sprintf("%s\t%.6f\t%d\t%.6f\t%.6f\t%.6f", token, frequency, samples, seconds, attack, release)
+      }
+    }
+    END {
+      # exit from fail() also runs END; only success may emit a plan.
+      if (failed) exit 2
+      if (count == 0) fail("score contains no notes or rests")
+      printf "tempo=%s events=%d duration=%.6f\n", tempo, count, total/rate
+      for (j=1; j<=count; j++) print events[j]
+    }
+  ')" || exit 2
+
+  if $print_frequency; then
+    printf '%s\n' "$score_plan" | "$awk_bin" 'NR>1 { print ($2 == 0 ? "0" : $2) }'
+    exit 0
+  fi
+  if $dry_run; then
+    printf '%s gain=%s wave=%s rate=%s server=%s sink=%s\n' \
+      "${score_plan%%$'\n'*}" "$gain" "$wave" "$rate" "${server:-default}" "${sink:-default}"
+    while IFS=$'\t' read -r note frequency samples seconds attack release; do
+      printf 'note=%s pitch=%s duration=%s samples=%s\n' "$note" "$frequency" "$seconds" "$samples"
+    done <<<"${score_plan#*$'\n'}"
+    exit 0
+  fi
+fi
+
+if ! $score_set && $print_frequency; then
+  printf '%s\n' "$resolved_pitch"
+  exit 0
+fi
+
+if ! $score_set && $dry_run; then
+  printf 'pitch=%s duration=%s gain=%s wave=%s rate=%s server=%s sink=%s\n' \
+    "$resolved_pitch" "$duration" "$gain" "$wave" "$rate" \
+    "${server:-default}" "${sink:-default}"
+  exit 0
+fi
+
+sox_bin="${CHIME_SOX:-sox}"
+paplay_bin="${CHIME_PAPLAY:-paplay}"
+command -v "$sox_bin" >/dev/null 2>&1 || die "SoX not found: $sox_bin"
+command -v "$paplay_bin" >/dev/null 2>&1 || die "paplay not found: $paplay_bin"
+
+if $score_set; then
+  pcm_file=$(mktemp "${TMPDIR:-/tmp}/chime-score.XXXXXXXX")
+  trap 'rm -f -- "$pcm_file"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  while IFS=$'\t' read -r note frequency samples seconds attack release; do
+    if [[ "$frequency" == 0.000000 ]]; then
+      # No dither on rests: silence must be zero PCM, not low-level noise.
+      "$sox_bin" -q -D -r "$rate" -n -t raw -L -r "$rate" -e signed-integer -b 16 -c 1 - \
+        trim 0 "${samples}s" >>"$pcm_file"
+    else
+      "$sox_bin" -q -r "$rate" -n -t raw -L -r "$rate" -e signed-integer -b 16 -c 1 - \
+        synth "${samples}s" "$wave" "$frequency" \
+        vol "$gain" fade h "$attack" "${samples}s" "$release" >>"$pcm_file"
+    fi
+  done <<<"${score_plan#*$'\n'}"
+  paplay_args=(--raw "--rate=$rate" --format=s16le --channels=1
+    --client-name=chime --stream-name=chime-score)
+  [[ -z "$server" ]] || paplay_args+=("--server=$server")
+  [[ -z "$sink" ]] || paplay_args+=("--device=$sink")
+  "$paplay_bin" "${paplay_args[@]}" <"$pcm_file"
+  exit 0
+fi
+
+attack="$($awk_bin -v duration="$duration" \
+  'BEGIN { value=duration/8; if (value>0.005) value=0.005; printf "%.6f", value }')"
+release="$($awk_bin -v duration="$duration" \
+  'BEGIN { value=duration/4; if (value>0.020) value=0.020; printf "%.6f", value }')"
+
+paplay_args=(
+  --raw
+  "--rate=$rate"
+  --format=s16le
+  --channels=1
+  --client-name=chime
+  "--stream-name=chime-${resolved_pitch}Hz"
+)
+[[ -z "$server" ]] || paplay_args+=("--server=$server")
+[[ -z "$sink" ]] || paplay_args+=("--device=$sink")
+
+"$sox_bin" -q -n -t raw -L -r "$rate" -e signed-integer -b 16 -c 1 - \
+  synth "$duration" "$wave" "$resolved_pitch" \
+  vol "$gain" \
+  fade h "$attack" "$duration" "$release" \
+  | "$paplay_bin" "${paplay_args[@]}"

@@ -1,0 +1,8 @@
+{
+  "baseUrl": "http://127.0.0.1:8765/route/v1",
+  "tokenFile": "/absolute/path/to/triage-bearer-token",
+  "stateDir": "/absolute/path/to/private/trg-pi-turns",
+  "allowLive": false,
+  "timeoutMs": 95000,
+  "maxTokens": 4096
+}

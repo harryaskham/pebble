@@ -1,0 +1,23 @@
+{
+  "enabled": false,
+  "context_file": "~/.local/state/pebble/context.json",
+  "legacy_text_archive": "~/.local/state/pebble/archive.sqlite3",
+  "pebble_project": "example",
+  "pebble_target": "node:example:assistant",
+  "jev": {"binary": "jev", "provider": "openrouter", "model": null, "timeout_secs": 20, "max_context_age_secs": 900},
+  "extractor": {"enabled": true, "model": "example-extractor", "base_url": "", "timeout_secs": 20, "max_output_tokens": 8192},
+  "caco": {"binary": "caco", "daemon_url": "http://127.0.0.1:11100", "token_file": "~/.config/pebble/caco.token", "timeout_secs": 130},
+  "status": {"attachment_file": "~/.local/state/pebble/router/pebble-state.json"},
+  "speech": {
+    "enabled": true,
+    "aztts": "aztts",
+    "player": "paplay",
+    "cache_dir": "~/.cache/pebble/speech",
+    "timeout_secs": 120,
+    "pulse_server": "",
+    "voices": {
+      "PEBBLE_UI_VOICE": "en-US-Ava", "PEBBLE_UI_SPEED": "1.0", "PEBBLE_UI_EMBEDDING": "",
+      "PEBBLE_SELF_VOICE": "en-US-Andrew", "PEBBLE_SELF_SPEED": "1.0", "PEBBLE_SELF_EMBEDDING": ""
+    }
+  }
+}

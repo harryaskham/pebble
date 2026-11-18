@@ -1,0 +1,26 @@
+# Trusted operator configuration, not webhook input or model-generated code.
+# Commands read the extracted UTF-8 payload on stdin. Never splice it into $().
+# External manifests are re-read for new requests; pending inputs keep their snapshot.
+actions:
+  note:
+    description: Store a private note when the user says note, note to self, or asks to save a thought.
+    extract: Extract the note text only, removing note-to-self framing. Preserve every detail and qualifier.
+    command: ["pebble-org-append", "--file", "~/org/notes.org"]
+    lane: notes
+  reminder:
+    description: Store a reminder when the user asks to be reminded of something. This saves a TODO, not a timed notification.
+    extract: Extract the reminder including all date, time, recurrence and timezone wording. Remove only remind-me framing.
+    command: ["pebble-org-append", "--file", "~/org/reminders.org", "--todo"]
+    lane: reminders
+  automation:
+    description: Send a request to the home automation webhook.
+    extract: Extract the requested automation in plain language.
+    command: |
+      token="$(cat "$HOME/.config/pebble/automation.token")"
+      curl --fail --silent --show-error \
+        -H "Authorization: Bearer $token" \
+        -H 'Content-Type: text/plain; charset=utf-8' \
+        --data-binary @- \
+        https://automation.example.invalid/pebble
+    timeout_secs: 30
+    lane: automation
