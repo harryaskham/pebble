@@ -7,13 +7,19 @@
     self,
     nixpkgs,
   }: let
-    systems = ["x86_64-linux" "aarch64-linux"];
+    linuxSystems = ["x86_64-linux" "aarch64-linux"];
+    systems = linuxSystems ++ ["x86_64-darwin" "aarch64-darwin"];
     forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system (import nixpkgs {inherit system;}));
+    forLinuxSystems = f: nixpkgs.lib.genAttrs linuxSystems (system: f system (import nixpkgs {inherit system;}));
   in {
-    packages = forAllSystems (_: pkgs: rec {
-      pebble = pkgs.callPackage ./nix/package.nix {};
-      default = pebble;
-    });
+    packages = forAllSystems (_: pkgs: let
+      client = pkgs.callPackage ./nix/client.nix {};
+    in
+      {pebble-client = client;}
+      // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux rec {
+        pebble = pkgs.callPackage ./nix/package.nix {};
+        default = pebble;
+      });
 
     homeManagerModules = rec {
       pebble = {pkgs, lib, ...}: {
@@ -23,7 +29,7 @@
       default = pebble;
     };
 
-    checks = forAllSystems (system: pkgs: let
+    checks = forLinuxSystems (system: pkgs: let
       python = pkgs.python3.withPackages (p: [p.pyyaml]);
       tested = pkgs.runCommand "pebble-tests" {
         nativeBuildInputs = [python pkgs.nodejs pkgs.ffmpeg pkgs.sox pkgs.pulseaudio pkgs.gawk pkgs.coreutils];
@@ -40,6 +46,7 @@
     in {
       inherit tested;
       package = self.packages.${system}.default;
+      client = self.packages.${system}.pebble-client;
     });
 
     formatter = forAllSystems (_: pkgs: pkgs.alejandra);
