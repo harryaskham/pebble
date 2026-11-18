@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Small Index-compatible webhook client; no local routing or action execution."""
+import argparse
+import contextlib
+import http.client
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+
+DEFAULT_URL = 'http://127.0.0.1:11301/pebble/route'
+MAX_INPUT = 64 * 1024 * 1024
+MAX_BODY = 8 * 1024 * 1024
+MAX_SECONDS = 120
+SAMPLE_BYTES = {'s16le': 2, 's16be': 2, 's32le': 4, 'f32le': 4}
+
+
+class Error(Exception):
+    pass
+
+
+def positive(value):
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('must be a positive number')
+    if not 0 < number <= 600:
+        raise argparse.ArgumentTypeError('must be greater than zero and at most 600')
+    return number
+
+
+def options():
+    p = argparse.ArgumentParser(description=__doc__, epilog='Capture: Enter, Ctrl-D or Ctrl-C finishes and sends. Piped audio sends at EOF or Ctrl-C. Ctrl-C after capture cancels the remaining work. No automatic upload retries.')
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--text', help='exact text to send (not rewritten)')
+    mode.add_argument('--audio', nargs='?', const=True, metavar='FILE|-', help='capture Pulse audio, or read FILE / stdin (-)')
+    p.add_argument('--server', help='Pulse server for capture; otherwise Pulse uses its environment/default')
+    p.add_argument('--source', help='Pulse source/device for capture')
+    p.add_argument('--seconds', type=positive, help='timed Pulse capture, at most 120 seconds; finish early with capture keys')
+    p.add_argument('--rate', type=int, help='raw PCM rate: capture defaults to 16000, stdin to pacat’s 44100')
+    p.add_argument('--channels', type=int, choices=(1, 2), help='raw PCM channels: capture defaults to 1, stdin to pacat’s 2')
+    p.add_argument('--format', choices=tuple(SAMPLE_BYTES), default='s16le' if sys.byteorder == 'little' else 's16be', help='raw PCM sample format (default: native signed 16-bit)')
+    p.add_argument('--audio-format', choices=('auto', 'pcm', 'wav', 'm4a'), default='auto', help='auto recognizes WAV/M4A; unframed stdin is PCM. Raw files require pcm')
+    p.add_argument('--dry-run', action='store_true', help='full server triage/speech, no action command; requires advertised support')
+    p.add_argument('--url', default=os.environ.get('PEBBLE_ROUTE_URL', DEFAULT_URL), help='webhook URL (or PEBBLE_ROUTE_URL)')
+    p.add_argument('--token-file', default=os.environ.get('PEBBLE_ROUTE_TOKEN_FILE', '~/.config/pebble/ingress.token'), help='private bearer-token file, symlinks allowed (or PEBBLE_ROUTE_TOKEN_FILE)')
+    p.add_argument('--timeout', type=positive, default=30, help='HTTP socket timeout in seconds (default: 30)')
+    p.add_argument('--pacat', default='pacat', help='Pulse capture executable')
+    p.add_argument('--ffmpeg', default='ffmpeg', help='audio normalization executable')
+    args = p.parse_args()
+    if args.audio is not True and any(v is not None for v in (args.server, args.source, args.seconds)):
+        p.error('--server, --source and --seconds require --audio without a file or dash')
+    if args.seconds is not None and args.seconds > MAX_SECONDS:
+        p.error('--seconds must be at most 120')
+    if args.rate is not None and not 8000 <= args.rate <= 192000:
+        p.error('--rate must be between 8000 and 192000 Hz')
+    if args.text is not None and (not args.text.strip() or '\0' in args.text or len(args.text.encode()) > 16384):
+        p.error('--text must contain 1–16384 UTF-8 bytes and no NUL')
+    return args
+
+
+def token_from_file(filename):
+    fd = os.open(Path(filename).expanduser(), os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        st = os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise Error('token must be an owner-private regular file (a symlink to it is fine)')
+        raw = stream.read(16385).strip()
+    if not raw or len(raw) > 16384 or any(c < 33 or c > 126 for c in raw):
+        raise Error('invalid token file')
+    return raw.decode('ascii')
+
+
+def destination(url, requested_dry):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ('http', 'https') or not parts.hostname or parts.username or parts.password or parts.fragment:
+            raise ValueError()
+        query = urllib.parse.parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
+        if set(query) - {'dry_run'} or len(query.get('dry_run', [])) > 1:
+            raise ValueError()
+        value = query.get('dry_run', [None])[0]
+        if value not in (None, 'true', 'false') or requested_dry and value == 'false':
+            raise ValueError()
+        dry = requested_dry or value == 'true'
+        # Both signals: the header is the protocol; the query also makes the
+        # pre-feature receiver reject rather than ignore a dry-run request.
+        if dry:
+            query['dry_run'] = ['true']
+        result = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, doseq=True)))
+        return result, dry
+    except ValueError as exc:
+        raise Error('invalid URL or conflicting dry-run mode') from exc
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def post(url, token, body, kind, dry, timeout, identity=None):
+    headers = {'Authorization': 'Bearer '+token, 'Content-Type': kind, 'X-Index-Webhook-Version': '1'}
+    if dry:
+        headers['X-Pebble-Dry-Run'] = 'true'
+    if identity:
+        headers['Idempotency-Key'] = identity
+    request = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                raise Error('response too large; do not retry blindly')
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError()
+            return response.status, value
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        exc.close()
+        raise Error(f'webhook returned HTTP {code}; no automatic retry') from None
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError):
+        raise Error('no valid webhook receipt; acceptance may be unknown, do not retry blindly') from None
+
+
+def stop_process(proc):
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+
+
+def capture(args, path, rate, channels):
+    interactive = sys.stdin.isatty()
+    if args.seconds is None and not interactive:
+        raise Error('non-interactive Pulse capture requires --seconds')
+    argv = [args.pacat, '--record', '--raw', f'--rate={rate}', f'--channels={channels}', f'--format={args.format}']
+    if args.server: argv += ['--server', args.server]
+    if args.source: argv += ['--device', args.source]
+    target = round(args.seconds * rate) * channels * SAMPLE_BYTES[args.format] if args.seconds else None
+    print('pebble-route: recording; '+('Enter / Ctrl-D / Ctrl-C finishes and sends' if target is None else f'{args.seconds:g} seconds; Ctrl-C finishes early and sends'), file=sys.stderr)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + (args.seconds + 15 if args.seconds else MAX_SECONDS)
+    total = 0
+    try:
+        with path.open('wb') as output:
+            while target is None or total < target:
+                if time.monotonic() >= deadline:
+                    raise Error('capture deadline reached; nothing uploaded')
+                sources = [proc.stdout] + ([sys.stdin] if interactive else [])
+                ready, _, _ = select.select(sources, [], [], min(.2, max(0, deadline-time.monotonic())))
+                if interactive and sys.stdin in ready:
+                    sys.stdin.readline()  # Enter or terminal EOF (Ctrl-D) finishes capture.
+                    break
+                if proc.stdout in ready:
+                    data = os.read(proc.stdout.fileno(), min(65536, target-total) if target else 65536)
+                    if not data:
+                        if proc.wait(timeout=2) != 0:
+                            raise Error('Pulse capture failed; check server/source; nothing uploaded')
+                        break
+                    total += len(data)
+                    if total > MAX_INPUT:
+                        raise Error('audio input limit exceeded; nothing uploaded')
+                    output.write(data)
+    except KeyboardInterrupt:
+        print('pebble-route: capture finished; preparing upload', file=sys.stderr)
+    finally:
+        stop_process(proc)
+        proc.stdout.close()
+
+
+def read_audio(source, path):
+    if source == '-' and sys.stdin.isatty():
+        raise Error('pipe audio to --audio -, or use --audio to capture Pulse')
+    if source == '-':
+        print('pebble-route: reading audio; EOF or Ctrl-C finishes and sends', file=sys.stderr)
+    stream = sys.stdin.buffer if source == '-' else open(Path(source).expanduser(), 'rb')
+    try:
+        with path.open('wb') as output:
+            total = 0
+            while True:
+                read = stream.read1 if source == '-' else stream.read
+                data = read(min(65536, MAX_INPUT + 1 - total))
+                if not data: break
+                total += len(data)
+                if total > MAX_INPUT:
+                    raise Error('audio input limit exceeded; nothing uploaded')
+                output.write(data)
+    except KeyboardInterrupt:
+        if source != '-': raise
+        print('pebble-route: stream capture finished; preparing upload', file=sys.stderr)
+    finally:
+        if source != '-': stream.close()
+
+
+def normalize(args, path, rate, channels):
+    size = path.stat().st_size
+    if not size: raise Error('empty audio; nothing uploaded')
+    with path.open('rb') as stream: magic = stream.read(12)
+    kind = args.audio_format
+    if args.audio is True: kind = 'pcm'
+    if kind == 'auto':
+        kind = ('wav' if magic[:4] in (b'RIFF', b'RF64') and magic[8:12] == b'WAVE' else
+                'm4a' if magic[4:8] == b'ftyp' else 'pcm' if args.audio == '-' else None)
+        if kind is None: raise Error('unrecognized audio file; use WAV/M4A or --audio-format pcm')
+    argv = [args.ffmpeg, '-nostdin', '-v', 'error', '-y', '-protocol_whitelist', 'file,pipe']
+    if kind == 'pcm':
+        frame = channels * SAMPLE_BYTES[args.format]
+        if size % frame: raise Error('incomplete PCM frame; check --format/--channels; nothing uploaded')
+        if size / frame / rate > MAX_SECONDS: raise Error('audio exceeds 120 seconds; nothing uploaded')
+        argv += ['-f', args.format, '-ar', str(rate), '-ac', str(channels)]
+    else:
+        argv += ['-f', 'wav' if kind == 'wav' else 'mov']
+    out = path.with_suffix('.wav')
+    argv += ['-i', str(path), '-map', '0:a:0', '-map_metadata', '-1', '-vn', '-sn', '-dn',
+             '-t', str(MAX_SECONDS+1), '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', str(out)]
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        if proc.wait(timeout=45): raise Error('audio conversion failed; nothing uploaded')
+    except subprocess.TimeoutExpired:
+        raise Error('audio conversion timed out; nothing uploaded') from None
+    finally:
+        stop_process(proc)
+    with wave.open(str(out), 'rb') as wav:
+        if not wav.getnframes() or wav.getnframes()/wav.getframerate() > MAX_SECONDS:
+            raise Error('audio is empty or exceeds 120 seconds; nothing uploaded')
+    if out.stat().st_size > MAX_BODY - 65536: raise Error('audio upload too large')
+    return out.read_bytes()
+
+
+def multipart(fields, audio):
+    boundary = 'pebble-route-'+uuid.uuid4().hex
+    pieces = []
+    for key, value in fields.items():
+        pieces.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'.encode()+value.encode()+b'\r\n')
+    if audio is not None:
+        pieces.append(f'--{boundary}\r\nContent-Disposition: form-data; name="audio"; filename="recording.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode()+audio+b'\r\n')
+    pieces.append(f'--{boundary}--\r\n'.encode())
+    return b''.join(pieces), 'multipart/form-data; boundary='+boundary
+
+
+def main():
+    os.umask(0o077)
+    args = options()
+    try:
+        token = token_from_file(args.token_file)
+        url, dry = destination(args.url, args.dry_run)
+        if dry:
+            print('pebble-route: checking server dry-run support', file=sys.stderr)
+            status, probe = post(url, token, b'{"test":true}', 'application/json', True, args.timeout)
+            if status != 200 or probe.get('dry_run_supported') is not True or probe.get('archived') is not False:
+                raise Error('server has not confirmed dry-run support; nothing uploaded')
+        recorded = str(time.time_ns() // 1000000)
+        audio = None
+        if args.audio is not None:
+            rate = args.rate or (16000 if args.audio is True else 44100)
+            channels = args.channels or (1 if args.audio is True else 2)
+            with tempfile.TemporaryDirectory(prefix='pebble-route-') as folder:
+                path = Path(folder)/'input.audio'
+                if args.audio is True: capture(args, path, rate, channels)
+                else: read_audio(args.audio, path)
+                audio = normalize(args, path, rate, channels)
+        fields = {'recordedAt': recorded, 'client': 'pebble-route'}
+        if args.text is not None: fields['transcription'] = args.text
+        body, kind = multipart(fields, audio)
+        if len(body) > MAX_BODY: raise Error('upload too large')
+        identity = 'pebble-route-'+uuid.uuid4().hex
+        print(f'pebble-route: submitting {identity} ({"dry run" if dry else "LIVE"})', file=sys.stderr)
+        status, receipt = post(url, token, body, kind, dry, args.timeout, identity)
+        if status != 202 or receipt.get('archived') is not True or (dry and receipt.get('dry_run') is not True):
+            raise Error('unexpected submission receipt; inspect server state before retrying')
+        print(json.dumps(receipt, ensure_ascii=False))
+        print('pebble-route: archived; processing is asynchronous, not an execution/delivery receipt', file=sys.stderr)
+        return 0
+    except KeyboardInterrupt:
+        print('pebble-route: cancelled (if interrupted during upload, acceptance may be unknown)', file=sys.stderr)
+        return 130
+    except (Error, OSError, wave.Error) as exc:
+        message = str(exc) if isinstance(exc, Error) else type(exc).__name__+' (check token/audio paths and pacat/ffmpeg availability)'
+        print('pebble-route: '+message, file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

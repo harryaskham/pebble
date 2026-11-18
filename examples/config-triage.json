@@ -1,0 +1,133 @@
+{
+  "version": 2,
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 11301,
+    "request_timeout_secs": 30,
+    "max_connections": 4
+  },
+  "token_file": "~/.config/pebble/ingress.token",
+  "state_dir": "~/.local/state/pebble/audio",
+  "max_body_bytes": 8388608,
+  "max_pending": 128,
+  "max_archive_bytes": 10737418240,
+  "min_free_bytes": 1073741824,
+  "retry_delays_secs": [
+    2,
+    10,
+    30
+  ],
+  "ffmpeg": "ffmpeg",
+  "node": "node",
+  "transcription": {
+    "provider": "command",
+    "model": "whisper-1",
+    "command": [
+      "pebble-transcribe"
+    ],
+    "output": "json",
+    "language": "en",
+    "timeout_secs": 60,
+    "max_audio_secs": 120
+  },
+  "forward": {
+    "url": "",
+    "timeout_secs": 30,
+    "auth": "bearer-file",
+    "token_file": "~/.config/pebble/webhook.token",
+    "receipt": "http-2xx"
+  },
+  "chime": {
+    "enabled": false,
+    "argv": [
+      "pebble-chime"
+    ],
+    "server": "",
+    "pitch": 523.25,
+    "duration": 0.06,
+    "gain": 0.1
+  },
+  "commands": {
+    "enabled": true,
+    "context_file": "",
+    "legacy_text_archive": "",
+    "pebble_project": "",
+    "pebble_target": "",
+    "jev": {
+      "binary": "jev",
+      "provider": "openrouter",
+      "model": "openai/gpt-4.1-mini",
+      "timeout_secs": 20,
+      "max_context_age_secs": 900
+    },
+    "extractor": {
+      "enabled": true,
+      "model": "gpt-4.1-mini",
+      "base_url": "",
+      "timeout_secs": 20,
+      "max_output_tokens": 8192
+    },
+    "caco": {
+      "enabled": false,
+      "binary": "caco",
+      "daemon_url": "http://127.0.0.1:11100",
+      "token_file": "",
+      "timeout_secs": 130
+    },
+    "status": {
+      "attachment_file": "~/.local/state/pebble/router/pebble-state.json"
+    },
+    "speech": {
+      "enabled": false,
+      "provider": "command",
+      "command": [],
+      "agent_utils_dir": "",
+      "aztts": "aztts",
+      "player": "paplay",
+      "cache_dir": "~/.cache/pebble/speech",
+      "timeout_secs": 120,
+      "pulse_server": "",
+      "voices": {
+        "PEBBLE_UI_VOICE": "en-US-Ava",
+        "PEBBLE_UI_SPEED": "1.0",
+        "PEBBLE_UI_EMBEDDING": "",
+        "PEBBLE_SELF_VOICE": "en-US-Andrew",
+        "PEBBLE_SELF_SPEED": "1.0",
+        "PEBBLE_SELF_EMBEDDING": ""
+      }
+    },
+    "actions": {},
+    "actions_file": "~/.config/pebble/actions.yaml",
+    "project_aliases": {},
+    "routes": {
+      "/pebble/route": {
+        "action": "route",
+        "profile": "default"
+      },
+      "/pebble/work": {
+        "action": "route",
+        "profile": "work"
+      },
+      "/pebble/home": {
+        "action": "route",
+        "profile": "home"
+      }
+    },
+    "jev_profiles": {
+      "work": {
+        "model": "openai/gpt-4.1",
+        "actions": [
+          "note",
+          "reminder"
+        ]
+      },
+      "home": {
+        "model": "openai/gpt-4.1-mini",
+        "actions": [
+          "automation",
+          "reminder"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "triage": {
+      "api": "triage-chat-completions",
+      "apiKey": "trg-transport-resolves-credential",
+      "baseUrl": "http://127.0.0.1:11301/route/v1",
+      "modelOverrides": {
+        "triage-route-dry-run": {
+          "name": "Triage (dry run)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096
+        },
+        "triage-route": {
+          "name": "Triage (LIVE dispatch)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096
+        }
+      }
+    }
+  }
+}

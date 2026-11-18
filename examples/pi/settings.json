@@ -1,0 +1,7 @@
+{
+  "defaultProvider": "openai",
+  "defaultModel": "gpt-4.1",
+  "enabledModels": ["openai/gpt-4.1"],
+  "compaction": {"enabled": true, "keepRecentTokens": 40000, "reserveTokens": 64000},
+  "packages": ["./pebble-triage/index.ts"]
+}
