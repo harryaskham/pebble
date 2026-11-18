@@ -3,7 +3,6 @@
   stdenvNoCC,
   makeWrapper,
   python3,
-  ffmpeg,
 }:
 stdenvNoCC.mkDerivation {
   pname = "pebble-client";
@@ -15,8 +14,7 @@ stdenvNoCC.mkDerivation {
     runHook preInstall
     mkdir -p $out/bin
     makeWrapper ${python3}/bin/python3 $out/bin/pebble-route \
-      --add-flags $src/pebble-route \
-      --prefix PATH : ${lib.makeBinPath [ffmpeg]}
+      --add-flags $src/pebble-route
     makeWrapper ${python3}/bin/python3 $out/bin/pebble-org-append \
       --add-flags $src/pebble-org-append
     runHook postInstall
